@@ -1,0 +1,16 @@
+# Virtual environment
+venv/
+*.pyc
+__pycache__/
+
+# Sensitive files
+.env
+credentials.json
+token.pickle
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
