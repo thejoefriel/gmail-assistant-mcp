@@ -5,8 +5,10 @@ Also connects with a Google Doc file that outlines my writing style and useful c
 
 ## How it works
 
+There's 3 toosl to use:
 - Ask Claude to fetch emails
-- Ask Claude to draft replies to any of those emails
+- Ask Claude to draft replies to any of those emails (where you are the "to" (not "cc"))
+- Ask Claude to fetch last 10 emails and draft replies for ones where they are "to" you
 
 ## Requirements
 
