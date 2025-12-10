@@ -37,12 +37,14 @@ class GmailClient:
         status, messages = self.imap.search(None, "UNSEEN")
         
         if status != "OK":
-            return []
+            return {"to_me": [], "cc_me": []}
         
         email_ids = messages[0].split()
         email_ids = email_ids[-max_results:]  # Get latest N emails
         
-        emails = []
+        to_me = []
+        cc_me = []
+        
         for email_id in email_ids:
             try:
                 # Fetch email data
@@ -58,22 +60,46 @@ class GmailClient:
                 subject = self._decode_header(msg["Subject"])
                 from_addr = msg["From"]
                 date = msg["Date"]
+
+                # Get To and CC fields - they might be tuples or strings
+                to_field = msg.get("To", "")
+                cc_field = msg.get("Cc", "")
+
+                # Convert to string if tuple
+                if isinstance(to_field, tuple):
+                    to_field = ", ".join(str(x) for x in to_field)
+                if isinstance(cc_field, tuple):
+                    cc_field = ", ".join(str(x) for x in cc_field)
+
+                # Ensure they're strings
+                to_field = str(to_field) if to_field else ""
+                cc_field = str(cc_field) if cc_field else ""
                 
                 # Get email body
                 body = self._get_email_body(msg)
+
+                email_data = {
+                "id": email_id.decode(),
+                "from": from_addr,
+                "subject": subject,
+                "date": date,
+                "to": to_field,
+                "cc": cc_field,
+                "body": body[:2000] if body else ""
+            }
                 
-                emails.append({
-                    "id": email_id.decode(),
-                    "from": from_addr,
-                    "subject": subject,
-                    "date": date,
-                    "body": body[:2000] if body else ""  # First 500 chars
-                })
+            # Check if user email is in To or CC field
+                if self.email_address.lower() in to_field.lower():
+                    to_me.append(email_data)
+                elif self.email_address.lower() in cc_field.lower():
+                    cc_me.append(email_data)
+                else:
+                    # If we can't determine, put in to_me as default
+                    to_me.append(email_data)
             except Exception as e:
                 logger.error(f"Error processing email {email_id}: {e}")
                 continue
-        
-        return emails
+        return {"to_me": to_me, "cc_me": cc_me}
     
     def _decode_header(self, header):
         """Decode email header."""

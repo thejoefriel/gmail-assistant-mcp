@@ -37,23 +37,68 @@ gmail_client = GmailClient(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)  # Changed from 'anthropic' to 'anthropic_client'
 
 # Create Google Docs helper
-base_path = Path(__file__).parent.parent.parent
-credentials_path = base_path / "credentials.json"
-token_path = base_path / "token.pickle"
+credentials_path = Path.home() / "mcp-servers/gmail-assistant-mcp/credentials.json"
+token_path = Path.home() / "mcp-servers/gmail-assistant-mcp/token.pickle"
 
 google_docs_helper = None
 if GUIDELINES_DOC_ID:
-    google_docs_helper = GoogleDocsHelper(
-        credentials_path=str(credentials_path),
-        token_path=str(token_path)
-    )
-    logger.info("Google Docs helper initialized")
+    if credentials_path.exists() and token_path.exists():
+        google_docs_helper = GoogleDocsHelper(
+            credentials_path=str(credentials_path),
+            token_path=str(token_path)
+        )
+        logger.info("Google Docs helper initialized")
+    else:
+        logger.warning("Google Docs credentials or token file does not exist - will not use email guidelines")
 else:
     logger.warning("No GUIDELINES_DOC_ID set - will not use email guidelines")
 
 
 # Create server instance
 app = Server("gmail-assistant")
+
+# Helper function to fetch guidelines
+async def fetch_guidelines():
+    """Fetch email guidelines from Google Doc if available."""
+    if not google_docs_helper or not GUIDELINES_DOC_ID:
+        return ""
+    
+    logger.info("Fetching email guidelines from Google Doc...")
+    
+    try:
+        guidelines = google_docs_helper.get_document_text(GUIDELINES_DOC_ID)
+        logger.info(f"Guidelines fetched successfully ({len(guidelines)} chars)")
+        return guidelines
+    except Exception as e:
+        logger.warning(f"Could not fetch guidelines: {e}")
+        return ""
+
+# Helper function to build prompt with guidelines
+def build_reply_prompt(sender, subject, email_content, guidelines):
+    """Build prompt for generating email with guidelines."""
+    prompt = f"""Generate a professional and helpful email reply to the following email:
+
+From: {sender}
+Subject: {subject}
+
+Email content:
+{email_content}
+
+"""
+        
+    if guidelines:
+        prompt += f"""
+IMPORTANT: Follow these email writing guidelines:
+
+{guidelines}
+
+"""
+    prompt += """
+Please write a thoughtful, professional reply. Be concise but warm. Aim to reply in 3-4 short paragraphs maximum. Only provide the email body text, no subject line or signatures."""
+     
+    return prompt
+
+
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
@@ -98,6 +143,20 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["email_id", "email_content", "sender", "subject"]
             }
+        ),
+        Tool(
+            name="get_unread_and_draft_replies",
+            description="Fetch unread emails and automatically create AI-powered draft replies for all emails sent directly to you (not CC'd)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "max_results": {
+                        "type": "number",
+                        "description": "Maximum number of emails to fetch (default: 10)",
+                        "default": 10
+                    }
+                }
+            }
         )
     ]
 
@@ -109,11 +168,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         try:
             emails = gmail_client.get_unread_emails(max_results=max_results)
-            
+
+            # Format the grouped results
+            result = f"""📧 UNREAD EMAILS (Latest {max_results})
+
+    📩 DIRECTLY TO YOU ({len(emails['to_me'])} emails):
+    {json.dumps(emails['to_me'], indent=2)}
+
+    📋 CC'D TO YOU ({len(emails['cc_me'])} emails):
+    {json.dumps(emails['cc_me'], indent=2)}
+    """
+
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps(emails, indent=2)
+                    text=result
                 )
             ]
         except Exception as e:
@@ -133,37 +202,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         try:
             # Fetch guidelines from Google Doc if available
-            guidelines = ""
-            if google_docs_helper and GUIDELINES_DOC_ID:
-                logger.info("Fetching email guidelines from Google Doc...")
-                try:
-                    guidelines = google_docs_helper.get_document_text(GUIDELINES_DOC_ID)
-                    logger.info(f"Guidelines fetched successfully ({len(guidelines)} chars)")
-                except Exception as e:
-                    logger.warning(f"Could not fetch guidelines: {e}")
-                    guidelines = ""
+            guidelines = await fetch_guidelines()
 
             # Build the prompt with guidelines
-            prompt = f"""Generate a professional and helpful email reply to the following email:
-
-From: {sender}
-Subject: {subject}
-
-Email content:
-{email_content}
-
-"""
-        
-            if guidelines:
-                prompt += f"""
-IMPORTANT: Follow these email writing guidelines:
-
-{guidelines}
-
-"""
-            prompt += """
-Please write a thoughtful, professional reply. Be concise but warm. Only provide the email body text, no subject line or signatures."""
-        
+            prompt = build_reply_prompt(sender, subject, email_content, guidelines)
 
             # Use Anthropic API to generate reply
             logger.info("Requesting AI-generated reply via Anthropic API...")
@@ -208,6 +250,97 @@ Please write a thoughtful, professional reply. Be concise but warm. Only provide
                 )
             ]
     
+    elif name == "get_unread_and_draft_replies":
+        max_results = arguments.get("max_results", 10)
+
+        try:
+            # Fetch emails
+            emails = gmail_client.get_unread_emails(max_results=max_results)
+            to_me_emails = emails['to_me']
+        
+            if not to_me_emails:
+                return [
+                    TextContent(
+                        type="text",
+                        text="📭 No unread emails sent directly to you!"
+                    )
+                ]
+            
+            # Fetch guidelines once using helper
+            guidelines = await fetch_guidelines()
+            
+            # Create drafts for all "To Me" emails
+            results = []
+            for email_item in to_me_emails:
+                try:
+                    logger.info(f"Creating draft for email from {email_item['from']}")
+                    
+                    # Build prompt using helper
+                    prompt = build_reply_prompt(
+                        email_item['from'],
+                        email_item['subject'],
+                        email_item['body'],
+                        guidelines
+                    )
+                    
+                    # Generate reply using Claude
+                    message = anthropic_client.messages.create(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=1000,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    
+                    generated_reply = message.content[0].text
+                    
+                    # Create draft in Gmail
+                    gmail_client.create_draft_reply(
+                        to_email=email_item['from'],
+                        subject=email_item['subject'],
+                        body=generated_reply
+                    )
+                    
+                    results.append({
+                        "from": email_item['from'],
+                        "subject": email_item['subject'],
+                        "status": "✅ Draft created",
+                        "preview": generated_reply[:100] + "..."
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error creating draft for {email_item['from']}: {e}")
+                    results.append({
+                        "from": email_item['from'],
+                        "subject": email_item['subject'],
+                        "status": f"❌ Failed: {str(e)}"
+                    })
+            
+            # Format summary
+            summary = f"""📧 Processed {len(to_me_emails)} emails sent directly to you:
+
+    """
+            for result in results:
+                summary += f"\n{result['status']} - From: {result['from']}\n   Subject: {result['subject']}\n"
+                if 'preview' in result:
+                    summary += f"   Preview: {result['preview']}\n"
+            
+            summary += f"\n\n📋 Skipped {len(emails['cc_me'])} CC'd emails (no drafts created)"
+            
+            return [
+                TextContent(
+                    type="text",
+                    text=summary
+                )
+            ]
+        
+        except Exception as e:
+            logger.error(f"Error in get_unread_and_draft_replies: {e}")
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {str(e)}"
+                )
+            ]
+
     raise ValueError(f"Unknown tool: {name}")
 
 async def main():
